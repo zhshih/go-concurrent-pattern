@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,14 +42,14 @@ func extractURLs(html string) []string {
 }
 
 // Generator pattern
-func generateURLs(entryURLs ...string) <-chan string {
+func generateURLs(ctx context.Context, entryURLs ...string) <-chan string {
 	out := make(chan string)
 	go func() {
 		defer close(out)
 		seen := make(map[string]bool)
 		var count int
-		var generate func(url string)
-		generate = func(url string) {
+		var generate func(ctx context.Context, url string)
+		generate = func(ctx context.Context, url string) {
 			if count >= maxURL {
 				return
 			}
@@ -90,60 +91,71 @@ func generateURLs(entryURLs ...string) <-chan string {
 				log.Println("error reading body:", err)
 				return
 			}
-			for _, url := range extractURLs(string(body)) {
+			for _, u := range extractURLs(string(body)) {
 				if count >= maxURL {
 					log.Println("stop generating URL due to exceeding max count")
 					return
 				}
-				log.Printf("generate URL = %s", url)
-				out <- url
-
-				time.Sleep(delay)
-
-				generate(url)
+				select {
+				case <-ctx.Done():
+					return
+				case out <- u:
+					log.Printf("generate URL = %s", u)
+					time.Sleep(delay)
+					go generate(ctx, u)
+				}
 			}
 		}
 		for _, entryURL := range entryURLs {
-			generate(entryURL)
+			generate(ctx, entryURL)
 		}
 	}()
 	return out
 }
 
 // Fan-out pattern
-func fetchURL(urls <-chan string) <-chan string {
+func fetchURL(ctx context.Context, urls <-chan string) <-chan string {
 	out := make(chan string)
 	go func() {
 		defer close(out)
 		for url := range urls {
-			log.Printf("fetch URL = %s", url)
-			resp, err := http.Get(url)
-			if err != nil {
-				log.Println("error fetching URL:", err)
-				continue
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				log.Printf("fetch URL = %s", url)
+				resp, err := http.Get(url)
+				if err != nil {
+					log.Println("error fetching URL:", err)
+					continue
+				}
+				body, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err != nil {
+					log.Println("error reading body:", err)
+					continue
+				}
+				out <- string(body)
 			}
-			body, err := io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				log.Println("error reading body:", err)
-				continue
-			}
-			out <- string(body)
 		}
-		close(out)
 	}()
 	return out
 }
 
 // Fan-in pattern
-func processResponses(responses []<-chan string) <-chan string {
+func processResponses(ctx context.Context, responses []<-chan string) <-chan string {
 	var wg sync.WaitGroup
 	out := make(chan string)
 
 	output := func(c <-chan string) {
 		defer wg.Done()
 		for resp := range c {
-			out <- resp
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				out <- resp
+			}
 		}
 	}
 
@@ -161,45 +173,54 @@ func processResponses(responses []<-chan string) <-chan string {
 }
 
 // Pipeline pattern
-func processHTML(html <-chan string) <-chan string {
+func processHTML(ctx context.Context, html <-chan string) <-chan string {
 	out := make(chan string)
 	go func() {
 		defer close(out)
-		for h := range html {
-			doc, err := goquery.NewDocumentFromReader(strings.NewReader(h))
-			if err != nil {
-				log.Println("error parsing HTML:", err)
-				continue
-			}
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case h, ok := <-html:
+				if !ok {
+					return
+				}
+				doc, err := goquery.NewDocumentFromReader(strings.NewReader(h))
+				if err != nil {
+					log.Println("error parsing HTML:", err)
+					continue
+				}
 
-			title := doc.Find("h1").Text()
-			author := doc.Find(".author").Text()
-			date := doc.Find(".date").Text()
-			category := doc.Find(".category").Text()
-			content := doc.Find(".content").Text()
-			if len(content) > 50 {
-				content = content[:50] + "...(remaining content has been omitted for brevity)"
+				title := doc.Find("h1").Text()
+				author := doc.Find(".author").Text()
+				date := doc.Find(".date").Text()
+				category := doc.Find(".category").Text()
+				content := doc.Find(".content").Text()
+				if len(content) > 50 {
+					content = content[:50] + "...(remaining content has been omitted for brevity)"
+				}
+				article := Article{
+					Title:    title,
+					Author:   author,
+					Date:     date,
+					Category: category,
+					Content:  content,
+				}
+				jsonStr, err := json.Marshal(article)
+				if err != nil {
+					log.Println("error marshal article:", err)
+					continue
+				}
+				processedHTML := fmt.Sprintf("processed HTML = %s", string(jsonStr))
+				out <- processedHTML
 			}
-			article := Article{
-				Title:    title,
-				Author:   author,
-				Date:     date,
-				Category: category,
-				Content:  content,
-			}
-			jsonStr, err := json.Marshal(article)
-			if err != nil {
-				log.Println("error marshal article:", err)
-			}
-			processedHTML := fmt.Sprintf("processed HTML = %s", string(jsonStr))
-			out <- processedHTML
 		}
 	}()
 	return out
 }
 
 // Worker pool pattern
-func workerPool(in <-chan string, numWorkers int) <-chan string {
+func workerPool(ctx context.Context, in <-chan string, numWorkers int) <-chan string {
 	out := make(chan string)
 	var wg sync.WaitGroup
 
@@ -207,9 +228,17 @@ func workerPool(in <-chan string, numWorkers int) <-chan string {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for html := range in {
-				processedHTML := html
-				out <- processedHTML
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case html, ok := <-in:
+					if !ok {
+						return
+					}
+					processedHTML := html
+					out <- processedHTML
+				}
 			}
 		}()
 	}
@@ -225,25 +254,28 @@ func workerPool(in <-chan string, numWorkers int) <-chan string {
 func main() {
 	entryURLs := []string{"https://en.wikipedia.org/wiki/Main_Page"}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Generate URLs from entry URLs
-	urlChannel := generateURLs(entryURLs...)
+	urlChannel := generateURLs(ctx, entryURLs...)
 
 	// Fetch HTML content from URLs
 	numWorkers := runtime.NumCPU()
 	fetchedChannels := make([]<-chan string, numWorkers)
 	for i := 0; i < numWorkers; i++ {
-		fetchedChannels[i] = fetchURL(urlChannel)
+		fetchedChannels[i] = fetchURL(ctx, urlChannel)
 	}
 
 	// Collect and merge HTML content from multiple channels
-	processedHTML := processResponses(fetchedChannels)
+	processedHTML := processResponses(ctx, fetchedChannels)
 
 	// Process HTML content
-	processedData := processHTML(processedHTML)
+	processedData := processHTML(ctx, processedHTML)
 
 	// Worker pool for processing HTML content
 	numWorkerPool := 2
-	finalResult := workerPool(processedData, numWorkerPool)
+	finalResult := workerPool(ctx, processedData, numWorkerPool)
 
 	// Output
 	for res := range finalResult {
