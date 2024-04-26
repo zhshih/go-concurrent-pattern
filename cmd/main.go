@@ -48,67 +48,73 @@ func generateURLs(ctx context.Context, entryURLs ...string) <-chan string {
 		defer close(out)
 		seen := make(map[string]bool)
 		var count int
-		var generate func(ctx context.Context, url string)
-		generate = func(ctx context.Context, url string) {
-			if count >= maxURL {
-				return
-			}
-			if seen[url] {
-				return
-			}
-			seen[url] = true
+		queue := make(chan string, maxURL) // Use a queue to implement BFS.
+		for _, entryURL := range entryURLs {
+			queue <- entryURL
+			seen[entryURL] = true
 			count++
+		}
 
-			resp, err := http.Get(url + "/robots.txt")
-			if err != nil {
-				log.Println("error fetching robots.txt:", err)
-				return
-			}
-			defer resp.Body.Close()
-			data, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Println("error reading robots.txt:", err)
-				return
-			}
-			robots, err := robotstxt.FromBytes(data)
-			if err != nil {
-				log.Println("error parsing robots.txt:", err)
-				return
-			}
-			if !robots.TestAgent(url, "Test123") {
-				log.Println("URL disallowed by robots.txt:", url)
-				return
-			}
-
-			resp, err = http.Get(url)
-			if err != nil {
-				log.Println("error fetching URL:", err)
-				return
-			}
-			defer resp.Body.Close()
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				log.Println("error reading body:", err)
-				return
-			}
-			for _, u := range extractURLs(string(body)) {
-				if count >= maxURL {
-					log.Println("stop generating URL due to exceeding max count")
-					return
-				}
+		generate := func(ctx context.Context) {
+			for {
 				select {
 				case <-ctx.Done():
 					return
-				case out <- u:
-					log.Printf("generate URL = %s", u)
-					time.Sleep(delay)
-					go generate(ctx, u)
+				case url := <-queue:
+					resp, err := http.Get(url + "/robots.txt")
+					if err != nil {
+						log.Println("error fetching robots.txt:", err)
+						continue
+					}
+					defer resp.Body.Close()
+					data, err := io.ReadAll(resp.Body)
+					if err != nil {
+						log.Println("error reading robots.txt:", err)
+						continue
+					}
+					robots, err := robotstxt.FromBytes(data)
+					if err != nil {
+						log.Println("error parsing robots.txt:", err)
+						continue
+					}
+					if !robots.TestAgent(url, "Test123") {
+						log.Println("URL disallowed by robots.txt:", url)
+						continue
+					}
+
+					resp, err = http.Get(url)
+					if err != nil {
+						log.Println("error fetching URL:", err)
+						continue
+					}
+					defer resp.Body.Close()
+					body, err := io.ReadAll(resp.Body)
+					if err != nil {
+						log.Println("error reading body:", err)
+						continue
+					}
+					for _, u := range extractURLs(string(body)) {
+						if count >= maxURL {
+							log.Println("stop generating URL due to exceeding max count")
+							return
+						}
+						if !seen[u] {
+							seen[u] = true
+							count++
+							select {
+							case <-ctx.Done():
+								return
+							case out <- u:
+								log.Printf("generate URL = %s", u)
+								queue <- u // Add new URLs to the queue.
+							}
+						}
+					}
 				}
 			}
 		}
-		for _, entryURL := range entryURLs {
-			generate(ctx, entryURL)
-		}
+
+		generate(ctx)
 	}()
 	return out
 }
